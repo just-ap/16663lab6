@@ -52,11 +52,14 @@ class RRT(Node):
         # you could add your own parameters to the rrt_params.yaml file,
         # and get them here as class attributes as shown above.
         self.lastTime = 0
+        self.lastTimePose = 0
         self.goalSampleRate = 10
-        self.gridSize = 500
-        self.resolution = 0.01
-        self.maxIter = 10
+        self.gridSize = 100
+        self.resolution = 0.05
+        self.maxIter = 100
         self.expandDis = 0.5
+        self.waypoint = []
+        self.lookaheadPP = 1.5
         # TODO: create subscribers
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -87,16 +90,18 @@ class RRT(Node):
             1
         )
 
+        self.ackermann_pub = self.create_publisher(AckermannDriveStamped, 'drive', 10)
+
 
         # publishers
         # TODO: create a drive message publisher, and other publishers that you might need
         self.Ogrid_pub = self.create_publisher(OccupancyGrid, 'Ogrid', 10)
 
-        filename = '/home/tianhao/sim_ws/src/f1tenth_lab6/lab6_pkg/waypoint/waypoints.csv'
+        filename = '/home/tianhao/sim_ws/src/f1tenth_lab6/lab6_pkg/waypoint/1waypoints.csv'
         with open (filename, 'r') as f:
             lines = f.readlines()
             self.wp = []
-
+            
 
             # print(wp[0][0])
             for line in lines:
@@ -113,7 +118,9 @@ class RRT(Node):
 
                 self.wp.append([tempx, tempy])
 
-        self.lookahead = 3.0
+            print(self.wp)
+
+        self.lookahead = 2.5
         # class attributes
         # TODO: maybe create your occupancy grid here
         self.occupancyGrid = None
@@ -121,7 +128,8 @@ class RRT(Node):
     def scan_callback(self, scan_msg):
         interval = scan_msg.header.stamp.nanosec - self.lastTime
 
-        if interval > 5e8 or interval < 0:
+        if interval > 1e7 or interval < 0:
+            self.lastTime = scan_msg.header.stamp.nanosec
             self.occupancyGrid = np.zeros((self.gridSize, self.gridSize)) #res = 1cm
             # for m in range(0, int(self.gridSize/2)):
             #     tempx = int(m * math.sqrt(3))
@@ -130,11 +138,11 @@ class RRT(Node):
             #             self.occupancyGrid[m + int(self.gridSize/2)][n] = 1
 
             for i in range (0, len(scan_msg.ranges)):
-                x = self.gridSize/2 - scan_msg.ranges[i] * math.sin(math.pi/4 + (i + 1) * scan_msg.angle_increment) * 100
-                y = scan_msg.ranges[i] * math.cos(math.pi/4 + (i + 1) * scan_msg.angle_increment)* 100+ self.gridSize
+                x = self.gridSize/2 - scan_msg.ranges[i] * math.sin(math.pi/4 + (i + 1) * scan_msg.angle_increment) * 20
+                y = scan_msg.ranges[i] * math.cos(math.pi/4 + (i + 1) * scan_msg.angle_increment)* 20+ self.gridSize
 
-                for j in range (0, 15):
-                    for k in range (0, 15):
+                for j in range (0, 6):
+                    for k in range (0, 6):
                         self.occupancyGrid[min(max(0, int(y - j)),self.gridSize - 1)][min(max(0, int(x - k)),self.gridSize - 1)] = 1
                         self.occupancyGrid[min(max(0, int(y + j)),self.gridSize - 1)][min(max(0, int(x + k)),self.gridSize - 1)] = 1
 
@@ -168,43 +176,64 @@ class RRT(Node):
         """
 
     def pose_callback(self, pose_msg):
-
-        if self.occupancyGrid is None:
-            return None
         carx = pose_msg.pose.pose.position.x
         cary = pose_msg.pose.pose.position.y
-        
+        if self.waypoint != []:
+            self.pure_pursuit(carx, cary)
+        interval = pose_msg.header.stamp.nanosec - self.lastTimePose
+        if interval > 1e7 or interval < 0:
+            self.waypoint = []
+            self.lastTimePose = pose_msg.header.stamp.nanosec
+            if self.occupancyGrid is None:
+                return None
 
-        tree = []
-        self.startPT = RRTNode()
-        self.startPT.x = 0.0
-        self.startPT.y = 0.0
-        self.startPT.is_root = True
-        self.goalPT = self.setGoal(carx, cary)
+            tree = []
+            self.startPT = RRTNode()
+            self.startPT.x = 0.0
+            self.startPT.y = 0.0
+            self.startPT.is_root = True
+            self.goalPT = self.setGoal(carx, cary)
 
-        tree.append(self.startPT)
-        path = None
-
-
-        for i in range(0, self.maxIter):
-            xt, yt = self.sample()
-            sampling = RRTNode()
-            sampling.x = xt
-            sampling.y = yt
-            nrIdx = self.nearest(tree, sampling)
-            nearestNode = tree[nrIdx]
-            newNode = self.steer(nearestNode, sampling)
-            collision = self.check_collision(nearestNode, newNode)
-            if collision:
-                tree.append(newNode)
-                nearGoal = self.is_goal(newNode, self.goalPT.x, self.goalPT.y)
-                if nearGoal:
-                    if self.check_collision(newNode, self.goalPT):
-                        lastIdx = len(tree) - 1
-                        path = self.find_path(tree, tree[lastIdx])
-                        self.visualize_path(path)
+            tree.append(self.startPT)
+            path = None
 
 
+            for i in range(0, self.maxIter):
+                xt, yt = self.sample()
+                sampling = RRTNode()
+                sampling.x = xt
+                sampling.y = yt
+                nrIdx = self.nearest(tree, sampling)
+                nearestNode = tree[nrIdx]
+                newNode = self.steer(nearestNode, sampling)
+                collision = self.check_collision(nearestNode, newNode)
+                if collision:
+                    tree.append(newNode)
+                    nearGoal = self.is_goal(newNode, self.goalPT.x, self.goalPT.y)
+                    if nearGoal:
+                        if self.check_collision(newNode, self.goalPT):
+                            lastIdx = len(tree) - 1
+                            path = self.find_path(tree, tree[lastIdx])
+                            self.visualize_path(path)
+                            break
+
+            if path != None:
+                for i in range(0, len(path)):
+                    point = PointStamped()
+                    point.header.frame_id = "ego_racecar/base_link"
+                    point.point.x = float(path[i][0])
+                    point.point.y = float(path[i][1])
+                    point.point.z = 0.0
+                    try:
+                        t = self.tf_buffer.lookup_transform("map", "ego_racecar/base_link", rclpy.time.Time())
+                        pose_transformed = tf2_geometry_msgs.do_transform_point(point, t)
+                        # self.get_logger().info(f"Transformed pose path: {pose_transformed}")
+                        self.waypoint.append([pose_transformed.point.x, pose_transformed.point.y])
+                        # print(pose_transformed.point.y)
+                    except TransformException as ex:
+                        self.get_logger().info(
+                        f'Could not transform')
+    
 
 
         """
@@ -218,6 +247,46 @@ class RRT(Node):
         """
 
         return None
+    
+    def pure_pursuit(self, posx, posy):
+        dis = []
+        print(self.waypoint)
+        for i in range (len(self.waypoint)):
+            tempdis = math.sqrt((posx - float(self.waypoint[i][0]))**2 + (posy - float(self.waypoint[i][1]))**2)
+            # print(tempdis)
+            dis.append(tempdis)
+        closeIdx = dis.index(min(dis))
+
+        disl = []
+        for i in range (len(dis)):
+            temp = abs(dis[i] - self.lookaheadPP)
+            disl.append(temp)
+        if closeIdx > 1:
+            closeIdxLook = disl.index(min(disl[0: closeIdx]))
+        else:
+            closeIdxLook = 0
+        # print(closeIdxLook)
+        point = PointStamped()
+        point.header.frame_id = "map"
+        point.point.x = float(self.waypoint[closeIdxLook][0])
+        point.point.y = float(self.waypoint[closeIdxLook][1])
+        point.point.z = 0.0
+
+        try:
+            t = self.tf_buffer.lookup_transform("ego_racecar/base_link", "map", rclpy.time.Time())
+            pose_transformed = tf2_geometry_msgs.do_transform_point(point, t)
+            self.get_logger().info(f"Transformed pose: {pose_transformed}")
+            print(pose_transformed.point.y)
+        except TransformException as ex:
+            self.get_logger().info(
+                f'Could not transform')
+            return
+        
+        angle = 2 * pose_transformed.point.y/(self.lookaheadPP ** 2)
+        drive_msg = AckermannDriveStamped()
+        drive_msg.drive.steering_angle = angle
+        drive_msg.drive.speed = 0.7
+        self.ackermann_pub.publish(drive_msg)
     
     def visualize_path(self, path):
         # Create a MarkerArray
@@ -266,7 +335,7 @@ class RRT(Node):
             try:
                 t = self.tf_buffer.lookup_transform("ego_racecar/base_link", "map", rclpy.time.Time())
                 pose_transformed = tf2_geometry_msgs.do_transform_point(point, t)
-                self.get_logger().info(f"Transformed pose: {pose_transformed}")
+                # self.get_logger().info(f"Transformed pose: {pose_transformed}")
                 # transfer waypoint to car frame, find the point in freespace to be the goal
                 if pose_transformed.point.y > -2.5 and pose_transformed.point.y < 2.5 and pose_transformed.point.x > 0.0 and pose_transformed.point.x < 5.0:
                     tempWP.append([pose_transformed.point.x, pose_transformed.point.y])
@@ -278,17 +347,18 @@ class RRT(Node):
         # print(tempWP)
         dis = []
         for i in range (len(tempWP)):
-            tempdis = math.sqrt(float(tempWP[i][0])**2 + float(tempWP[i][1]))**2 - self.lookahead
-                # print(tempdis)
+            tempdis = abs(math.sqrt(float(tempWP[i][0])**2 + float(tempWP[i][1])**2) - self.lookahead)
+
             dis.append(tempdis)
 
         # print(dis)
         if len(tempWP) == 0:
-            goalNode.x = 5.0
+            goalNode.x = 1.0
             goalNode.y = 0.0
             return goalNode
         elif len(tempWP) > 1:
             closeIdx = dis.index(min(dis))
+            print(closeIdx)
         else:
             closeIdx = 0
 
@@ -329,7 +399,7 @@ class RRT(Node):
         # print("1111111")
         # print(len(idx[0]))
         if random.randint(0, 100) > self.goalSampleRate:
-            rnd = random.randint(0, len(idx[0]))
+            rnd = random.randint(0, len(idx[0]) - 1)
             x = idx[0][rnd] * self.resolution
             y = idx[1][rnd] * self.resolution - self.gridSize * self.resolution/2
             # print(x, "||", y)
@@ -398,12 +468,13 @@ class RRT(Node):
         # print("y", int(new_node.y * 100), "||", int(nearest_node.y * 100))
         # print("x", int(new_node.x * 100), "||", int(nearest_node.x * 100))
         # if new_node.x < nearest_node.x:
-        for i in range(int(nearest_node.x * 100), int(new_node.x * 100)):
+        # print(nearest_node.x, "||||", new_node.x)
+        for i in range(min(int(nearest_node.x * 20), int(new_node.x * 20)), max(int(nearest_node.x * 20), int(new_node.x * 20))):
             # print("i=", i)
-            tempy = int((i - new_node.x* 100) * slope + new_node.y * 100 + self.gridSize/2)
+            tempy = int((i - nearest_node.x* 20) * slope + nearest_node.y * 20 + self.gridSize/2)
             tempx = int(self.gridSize - 1 - i)
             # print("trans", tempx, "||", tempy)
-            if self.occupancyGrid[min(max(0,tempx), 499)][min(max(0,tempy), 499)] == 1:
+            if self.occupancyGrid[min(max(0,tempx), 99)][min(max(0,tempy), 99)] == 1:
                 # print("fffffff")
                 return False
         
@@ -457,7 +528,7 @@ class RRT(Node):
             path.append([node.x, node.y])
             latest_added_node = node.parent
         path.append([self.startPT.x, self.startPT.y])
-        print(path)
+        # print(path)
         return path
 
 
